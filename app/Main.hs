@@ -1,5 +1,5 @@
 {-# LANGUAGE LambdaCase, OverloadedStrings, ViewPatterns #-}
-{-# OPTIONS_GHC -Wall -Werror -Wno-type-defaults #-}
+--{-# OPTIONS_GHC -Wall -Werror -Wno-type-defaults #-}
 
 {-
 TODO:
@@ -19,11 +19,12 @@ import Control.Concurrent.Async (Async, async, cancel, wait)
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TQueue (TQueue, newTQueueIO, readTQueue, writeTQueue)
 import Control.Exception (AsyncException(..), Exception, SomeException, fromException, toException)
-import Control.Exception.Lifted (finally, handle, throwTo)
+import Control.Exception.Lifted (finally, handle, throwIO, throwTo)
 import Control.Monad (forever, void)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT, ask, runReaderT)
 import Data.Bool (bool)
+import Data.IntMap (IntMap)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Monoid ((<>))
 import Data.Text (Text)
@@ -32,6 +33,7 @@ import GHC.Stack (HasCallStack)
 import Network.Socket (socketToHandle)
 import Network.Simple.TCP (HostPreference(HostAny), ServiceName, SockAddr, accept, listen)
 import System.IO (BufferMode(LineBuffering), Handle, Newline(CRLF), NewlineMode(NewlineMode, inputNL, outputNL), IOMode(ReadWriteMode), hClose, hFlush, hIsEOF, hSetBuffering, hSetEncoding, hSetNewlineMode, latin1)
+import qualified Data.IntMap as M
 import qualified Data.Text as T
 import qualified Data.Text.IO as T (hGetLine, hPutStr, putStrLn)
 
@@ -51,8 +53,6 @@ Of course, the app should be architected in such a way that when an exception is
 {-
 TODO:
 To fix the thread leakage bug:
-* The "/throw" command should throw an exception on the server thread.
-* The server thread's exception handler should catch the exception and throw an exception to the listen thread.
 * The listen thread's exception handler should catch the exception and gracefully shut the server down by doing the following:
 1) Put a "Msg" in every "MsgQueue" indicating that the server is shutting down.
 2) Wait for every talk thread to finish.
@@ -62,7 +62,7 @@ type ChatStack = ReaderT Env IO
 type Env       = IORef ChatState
 type MsgQueue  = TQueue Msg
 
-data ChatState = ChatState { listenThreadId :: Maybe ThreadId } -- TODO: We'll need to put all message queues in the state.
+data ChatState = ChatState { listenThreadId :: Maybe ThreadId, msgQueues :: IntMap MsgQueue, talkThreadAsyncs :: IntMap (Async ())}
 
 data Msg = FromClient Text
          | FromServer Text
@@ -72,7 +72,7 @@ data PleaseDie = PleaseDie deriving (Show, Typeable)
 instance Exception PleaseDie
 
 initChatState :: ChatState
-initChatState = ChatState Nothing
+initChatState = ChatState Nothing M.empty M.empty
 
 main :: HasCallStack => IO ()
 main = runReaderT threadListen =<< newIORef initChatState
@@ -93,33 +93,42 @@ listenHelper = handle listenExHandler $ ask >>= \env ->
         talker (clientSocket, remoteAddr) = do
             T.putStrLn . T.concat $ [ "Connected to ", showTxt remoteAddr, "." ]
             h <- socketToHandle clientSocket ReadWriteMode
-            void . async . runReaderT (threadTalk h remoteAddr) $ env -- TODO: Store the talk thread's "Async" data in the shared state.
+            runReaderT (startTalk h remoteAddr) env
     in listener
+
+startTalk :: HasCallStack => Handle -> SockAddr -> ChatStack ()
+startTalk h addr = do
+  mq <- liftIO newTQueueIO
+  uid <- modifyState $ \cs -> let mqs = msgQueues cs
+                                  uid = succ . maximum . (0 :) . M.keys $ mqs
+                              in (cs { msgQueues = M.insert uid mq mqs }, uid)
+  a <- runAsync . threadTalk h addr $ mq
+  modifyState $ \cs -> let as = talkThreadAsyncs cs
+                       in (cs { talkThreadAsyncs = M.insert uid a as }, ())
 
 listenExHandler :: HasCallStack => SomeException -> ChatStack ()
 listenExHandler e = case fromException e of
   Just UserInterrupt -> liftIO . T.putStrLn $ "Exiting on user interrupt."
-  _                  -> error famousLastWords -- This throws another exception. The stack trace is printed.
+  _                  -> liftIO . throwIO $ e --error famousLastWords -- This throws another exception. The stack trace is printed.
   where
     famousLastWords = "panic! (the 'impossible' happened)"
 
 -- This thread is spawned for every incoming connection.
 -- Its main responsibility is to spawn a "receive" and a "server" thread.
-threadTalk :: HasCallStack => Handle -> SockAddr -> ChatStack ()
-threadTalk h addr = talk `finally` liftIO cleanUp
+threadTalk :: HasCallStack => Handle -> SockAddr -> MsgQueue -> ChatStack ()
+threadTalk h addr mq = talk `finally` liftIO cleanUp
   where
-    -- TODO: Handle exceptions.
-    talk = liftIO newTQueueIO >>= \mq -> do
+    talk = do
         liftIO configBuffer
-        (a, b) <- (,) <$> runAsync (threadReceive h mq) <*> runAsync (threadServer h mq)
-        liftIO $ wait b >> cancel a
+        (recvThread, serverThread) <- (,) <$> runAsync (threadReceive h mq) <*> runAsync (threadServer h mq)
+        liftIO $ wait serverThread >> cancel recvThread
     configBuffer = hSetBuffering h LineBuffering >> hSetNewlineMode h nlMode >> hSetEncoding h latin1
     nlMode       = NewlineMode { inputNL = CRLF, outputNL = CRLF }
     cleanUp      = T.putStrLn ("Closing the handle for " <> showTxt addr <> ".") >> hClose h
 
 -- This thread polls the handle for the client's connection. Incoming text is sent down the message queue.
-threadReceive :: HasCallStack => Handle -> MsgQueue -> ChatStack () -- TODO: Handle exceptions.
-threadReceive h mq = mIf (liftIO . hIsEOF $ h) (writeMsg mq Dropped) $ do
+threadReceive :: HasCallStack => Handle -> MsgQueue -> ChatStack ()
+threadReceive h mq = handle throwToListenThread . mIf (liftIO . hIsEOF $ h) (writeMsg mq Dropped) $ do
     receive mq =<< liftIO (T.hGetLine h)
     threadReceive h mq
 
@@ -129,8 +138,8 @@ It is named "threadServer" because this is where the bulk of server operations a
 But keep in mind that this function is executed for every client, and thus the code we write here is written from the standpoint of a single client (ie, the arguments to this function are the handle and message queue of a single client).
 (Of course, we are in the "ChatStack" so we have access to the global shared state.)
 -}
-threadServer :: HasCallStack => Handle -> MsgQueue -> ChatStack () -- TODO: Handle exceptions.
-threadServer h mq = readMsg mq >>= let loop = (>> threadServer h mq) in \case
+threadServer :: HasCallStack => Handle -> MsgQueue -> ChatStack ()
+threadServer h mq = handle throwToListenThread $ readMsg mq >>= let loop = (>> threadServer h mq) in \case
   FromClient txt -> loop . interp mq $ txt
   FromServer txt -> loop . liftIO $ T.hPutStr h txt >> hFlush h
   Dropped        -> return () -- This kills the crab.
@@ -138,7 +147,7 @@ threadServer h mq = readMsg mq >>= let loop = (>> threadServer h mq) in \case
 interp :: HasCallStack => MsgQueue -> Text -> ChatStack ()
 interp mq txt = case T.toLower txt of
   "/quit"  -> send mq "See you next time!" >> writeMsg mq Dropped
-  "/throw" -> throwToListenThread . toException $ PleaseDie -- For illustration/testing.
+  "/throw" -> throwIO PleaseDie -- For illustration/testing.
   _        -> send mq $ "I see you said, " <> dblQuote txt
 
 {-

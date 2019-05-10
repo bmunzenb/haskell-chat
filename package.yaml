@@ -42,6 +42,7 @@ executables:
     - network-simple
     - stm
     - text
+    - containers
 
 tests:
   haskell-chat-test:
