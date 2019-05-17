@@ -1,5 +1,5 @@
-{-# LANGUAGE LambdaCase, OverloadedStrings, ViewPatterns #-}
---{-# OPTIONS_GHC -Wall -Werror -Wno-type-defaults #-}
+{-# LANGUAGE LambdaCase, OverloadedStrings #-}
+{-# OPTIONS_GHC -Wall -Werror -Wno-type-defaults #-}
 
 {-
 TODO:
@@ -15,12 +15,12 @@ Modules should only export the functions that other modules need.
 module Main (main) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.Async (Async, async, cancel, wait)
+import Control.Concurrent.Async (Async, AsyncCancelled(..), async, cancel, wait)
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TQueue (TQueue, newTQueueIO, readTQueue, writeTQueue)
-import Control.Exception (AsyncException(..), Exception, SomeException, fromException, toException)
+import Control.Exception (AsyncException(..), Exception, SomeException, fromException)
 import Control.Exception.Lifted (finally, handle, throwIO, throwTo)
-import Control.Monad (forever, void)
+import Control.Monad (forever)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT, ask, runReaderT)
 import Data.Bool (bool)
@@ -29,7 +29,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Monoid ((<>))
 import Data.Text (Text)
 import Data.Typeable (Typeable)
-import GHC.Stack (HasCallStack)
+import GHC.Stack (HasCallStack, callStack, prettyCallStack)
 import Network.Socket (socketToHandle)
 import Network.Simple.TCP (HostPreference(HostAny), ServiceName, SockAddr, accept, listen)
 import System.IO (BufferMode(LineBuffering), Handle, Newline(CRLF), NewlineMode(NewlineMode, inputNL, outputNL), IOMode(ReadWriteMode), hClose, hFlush, hIsEOF, hSetBuffering, hSetEncoding, hSetNewlineMode, latin1)
@@ -109,9 +109,7 @@ startTalk h addr = do
 listenExHandler :: HasCallStack => SomeException -> ChatStack ()
 listenExHandler e = case fromException e of
   Just UserInterrupt -> liftIO . T.putStrLn $ "Exiting on user interrupt."
-  _                  -> liftIO . throwIO $ e --error famousLastWords -- This throws another exception. The stack trace is printed.
-  where
-    famousLastWords = "panic! (the 'impossible' happened)"
+  _                  -> throwIO e
 
 -- This thread is spawned for every incoming connection.
 -- Its main responsibility is to spawn a "receive" and a "server" thread.
@@ -128,9 +126,14 @@ threadTalk h addr mq = talk `finally` liftIO cleanUp
 
 -- This thread polls the handle for the client's connection. Incoming text is sent down the message queue.
 threadReceive :: HasCallStack => Handle -> MsgQueue -> ChatStack ()
-threadReceive h mq = handle throwToListenThread . mIf (liftIO . hIsEOF $ h) (writeMsg mq Dropped) $ do
+threadReceive h mq = handle receiveExHandler . mIf (liftIO . hIsEOF $ h) (writeMsg mq Dropped) $ do
     receive mq =<< liftIO (T.hGetLine h)
     threadReceive h mq
+
+receiveExHandler :: HasCallStack => SomeException -> ChatStack ()
+receiveExHandler e = case fromException e of
+  Just AsyncCancelled -> return ()
+  _                   -> throwToListenThread e
 
 {-
 This thread polls the client's message queue and processes everything that comes down the queue.
@@ -183,7 +186,9 @@ Note that we don't use the "Async" library here because the listen thread is the
 When you do have an "Async" object, you can use the "asyncThreadId" function to get the thread ID for the "Async".
 -}
 throwToListenThread :: HasCallStack => SomeException -> ChatStack ()
-throwToListenThread e = maybeVoid (`throwTo` e) . listenThreadId =<< getState
+throwToListenThread e = do
+    maybeVoid (`throwTo` e) . listenThreadId =<< getState
+    liftIO . T.putStrLn . T.pack . prettyCallStack $ callStack
 
 --------------------
 -- Misc. bindings and utility functions
