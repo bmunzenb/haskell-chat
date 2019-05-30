@@ -26,6 +26,7 @@ import Control.Monad.Reader (ReaderT, ask, runReaderT)
 import Data.Bool (bool)
 import Data.IntMap (IntMap)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.List ((\\))
 import Data.Monoid ((<>))
 import Data.Text (Text)
 import Data.Typeable (Typeable)
@@ -101,7 +102,7 @@ startTalk :: HasCallStack => Handle -> ChatStack ()
 startTalk h = do
   mq <- liftIO newTQueueIO
   uid <- modifyState $ \cs -> let mqs = msgQueues cs
-                                  uid = succ . maximum . (0 :) . M.keys $ mqs
+                                  uid = head $ [0..] \\ M.keys mqs
                               in (cs { msgQueues = M.insert uid mq mqs }, uid)
   a <- runAsync . threadTalk uid h $ mq
   modifyState $ \cs -> let as = talkThreadAsyncs cs
