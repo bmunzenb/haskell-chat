@@ -31,7 +31,7 @@ import Data.Text (Text)
 import Data.Typeable (Typeable)
 import GHC.Stack (HasCallStack, callStack, prettyCallStack)
 import Network.Socket (socketToHandle)
-import Network.Simple.TCP (HostPreference(HostAny), ServiceName, SockAddr, accept, listen)
+import Network.Simple.TCP (HostPreference(HostAny), ServiceName, accept, listen)
 import System.IO (BufferMode(LineBuffering), Handle, Newline(CRLF), NewlineMode(NewlineMode, inputNL, outputNL), IOMode(ReadWriteMode), hClose, hFlush, hIsEOF, hSetBuffering, hSetEncoding, hSetNewlineMode, latin1)
 import qualified Data.IntMap as M
 import qualified Data.Text as T
@@ -61,6 +61,7 @@ To fix the thread leakage bug:
 type ChatStack = ReaderT Env IO
 type Env       = IORef ChatState
 type MsgQueue  = TQueue Msg
+type UserID    = Int
 
 data ChatState = ChatState { listenThreadId :: Maybe ThreadId, msgQueues :: IntMap MsgQueue, talkThreadAsyncs :: IntMap (Async ())}
 
@@ -93,16 +94,16 @@ listenHelper = handle listenExHandler $ ask >>= \env ->
         talker (clientSocket, remoteAddr) = do
             T.putStrLn . T.concat $ [ "Connected to ", showTxt remoteAddr, "." ]
             h <- socketToHandle clientSocket ReadWriteMode
-            runReaderT (startTalk h remoteAddr) env
+            runReaderT (startTalk h) env
     in listener
 
-startTalk :: HasCallStack => Handle -> SockAddr -> ChatStack ()
-startTalk h addr = do
+startTalk :: HasCallStack => Handle -> ChatStack ()
+startTalk h = do
   mq <- liftIO newTQueueIO
   uid <- modifyState $ \cs -> let mqs = msgQueues cs
                                   uid = succ . maximum . (0 :) . M.keys $ mqs
                               in (cs { msgQueues = M.insert uid mq mqs }, uid)
-  a <- runAsync . threadTalk h addr $ mq
+  a <- runAsync . threadTalk uid h $ mq
   modifyState $ \cs -> let as = talkThreadAsyncs cs
                        in (cs { talkThreadAsyncs = M.insert uid a as }, ())
 
@@ -113,8 +114,9 @@ listenExHandler e = case fromException e of
 
 -- This thread is spawned for every incoming connection.
 -- Its main responsibility is to spawn a "receive" and a "server" thread.
-threadTalk :: HasCallStack => Handle -> SockAddr -> MsgQueue -> ChatStack ()
-threadTalk h addr mq = talk `finally` liftIO cleanUp
+-- TODO: This function needs to know the user ID so the Env can be cleaned up when it finishes
+threadTalk :: HasCallStack => UserID -> Handle -> MsgQueue -> ChatStack ()
+threadTalk uid h mq = talk `finally` cleanUp
   where
     talk = do
         liftIO configBuffer
@@ -122,7 +124,11 @@ threadTalk h addr mq = talk `finally` liftIO cleanUp
         liftIO $ wait serverThread >> cancel recvThread
     configBuffer = hSetBuffering h LineBuffering >> hSetNewlineMode h nlMode >> hSetEncoding h latin1
     nlMode       = NewlineMode { inputNL = CRLF, outputNL = CRLF }
-    cleanUp      = T.putStrLn ("Closing the handle for " <> showTxt addr <> ".") >> hClose h
+    cleanUp      = do
+        modifyState $ \cs -> let mqs = msgQueues cs
+                                 tas = talkThreadAsyncs cs
+                             in (cs { msgQueues = M.delete uid mqs, talkThreadAsyncs = M.delete uid tas }, ())
+        liftIO . hClose $ h
 
 -- This thread polls the handle for the client's connection. Incoming text is sent down the message queue.
 threadReceive :: HasCallStack => Handle -> MsgQueue -> ChatStack ()
