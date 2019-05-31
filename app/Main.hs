@@ -18,7 +18,7 @@ import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.Async (Async, AsyncCancelled(..), async, cancel, wait)
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TQueue (TQueue, newTQueueIO, readTQueue, writeTQueue)
-import Control.Exception (AsyncException(..), Exception, SomeException, fromException)
+import Control.Exception (Exception, SomeException, fromException)
 import Control.Exception.Lifted (finally, handle, throwIO, throwTo)
 import Control.Monad (forever)
 import Control.Monad.IO.Class (liftIO)
@@ -49,14 +49,6 @@ Keep in mind that in Haskell, killing a parent thread does NOT kill its children
 Threads must be manually managed via the "Async" library. This takes careful thought and consideration.
 Threads should never be "leaked:" we don't ever want a situation in which a child thread is left running and no other threads are aware of it.
 Of course, the app should be architected in such a way that when an exception is thrown, it is handled gracefully. First and foremost, an exception must be caught on/by the thread on which the exception was thrown. If the exception represents something critical or unexpected (it's a bug, etc. - this is the vast majority of exceptions that we'll encounter in practice), and the exception occurs on a child thread, then the child thread should rethrow the exception to the listen (main) thread. The listen thread's exception handler should catch the rethrown exception and gracefully shut down, manually killing all child threads in the process.
--}
-
-{-
-TODO:
-To fix the thread leakage bug:
-* The listen thread's exception handler should catch the exception and gracefully shut the server down by doing the following:
-1) Put a "Msg" in every "MsgQueue" indicating that the server is shutting down.
-2) Wait for every talk thread to finish.
 -}
 
 type ChatStack = ReaderT Env IO
@@ -109,13 +101,13 @@ startTalk h = do
                        in (cs { talkThreadAsyncs = M.insert uid a as }, ())
 
 listenExHandler :: HasCallStack => SomeException -> ChatStack ()
-listenExHandler e = case fromException e of
-  Just UserInterrupt -> liftIO . T.putStrLn $ "Exiting on user interrupt."
-  _                  -> throwIO e
+listenExHandler e = getState >>= \cs -> do
+    mapM_ (`writeMsg` Dropped) . M.elems . msgQueues $ cs
+    mapM_ (liftIO . wait) . M.elems . talkThreadAsyncs $ cs
+    throwIO e
 
 -- This thread is spawned for every incoming connection.
 -- Its main responsibility is to spawn a "receive" and a "server" thread.
--- TODO: This function needs to know the user ID so the Env can be cleaned up when it finishes
 threadTalk :: HasCallStack => UserID -> Handle -> MsgQueue -> ChatStack ()
 threadTalk uid h mq = talk `finally` cleanUp
   where
