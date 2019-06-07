@@ -113,7 +113,7 @@ threadTalk uid h mq = talk `finally` cleanUp
   where
     talk = do
         liftIO configBuffer
-        (recvThread, serverThread) <- (,) <$> runAsync (threadReceive h mq) <*> runAsync (threadServer h mq)
+        (recvThread, serverThread) <- (,) <$> runAsync (threadReceive h mq) <*> runAsync (threadServer uid h mq)
         liftIO $ wait serverThread >> cancel recvThread
     configBuffer = hSetBuffering h LineBuffering >> hSetNewlineMode h nlMode >> hSetEncoding h latin1
     nlMode       = NewlineMode { inputNL = CRLF, outputNL = CRLF }
@@ -140,17 +140,18 @@ It is named "threadServer" because this is where the bulk of server operations a
 But keep in mind that this function is executed for every client, and thus the code we write here is written from the standpoint of a single client (ie, the arguments to this function are the handle and message queue of a single client).
 (Of course, we are in the "ChatStack" so we have access to the global shared state.)
 -}
-threadServer :: HasCallStack => Handle -> MsgQueue -> ChatStack ()
-threadServer h mq = handle throwToListenThread $ readMsg mq >>= let loop = (>> threadServer h mq) in \case
-  FromClient txt -> loop . interp mq $ txt
+threadServer :: HasCallStack => UserID -> Handle -> MsgQueue -> ChatStack ()
+threadServer uid h mq = handle throwToListenThread $ readMsg mq >>= let loop = (>> threadServer uid h mq) in \case
+  FromClient txt -> loop . interp uid mq $ txt
   FromServer txt -> loop . liftIO $ T.hPutStr h txt >> hFlush h
   Dropped        -> return () -- This kills the crab.
 
-interp :: HasCallStack => MsgQueue -> Text -> ChatStack ()
-interp mq txt = case T.toLower txt of
+interp :: HasCallStack => UserID -> MsgQueue -> Text -> ChatStack ()
+interp uid mq txt = case T.toLower txt of
   "/quit"  -> send mq "See you next time!" >> writeMsg mq Dropped
   "/throw" -> throwIO PleaseDie -- For illustration/testing.
-  _        -> send mq $ "I see you said, " <> dblQuote txt
+  _        -> getState >>= \cs -> let message = FromServer . nl $ txt
+                                  in mapM_ (`writeMsg` message) . M.elems . M.delete uid . msgQueues $ cs
 
 {-
 The Haskell language, software transactional memory, and this app are all architected in such a way that we need not concern ourselves with the usual pitfalls of sharing state across threads. This automatically rules out a whole class of potential bugs! Just remember the following:
@@ -209,8 +210,8 @@ nl = (<> nlTxt)
 nlTxt :: Text
 nlTxt = T.singleton '\n'
 
-dblQuote :: Text -> Text
-dblQuote txt = let a = T.singleton '"' in a <> txt <> a
+--dblQuote :: Text -> Text
+--dblQuote txt = let a = T.singleton '"' in a <> txt <> a
 
 showTxt :: (Show a) => a -> Text
 showTxt = T.pack . show
