@@ -150,6 +150,7 @@ interp :: HasCallStack => UserID -> MsgQueue -> Text -> ChatStack ()
 interp uid mq txt = case T.toLower txt of
   "/quit"  -> send mq "See you next time!" >> writeMsg mq Dropped
   "/throw" -> throwIO PleaseDie -- For illustration/testing.
+  "/users" -> usersCommand mq
   _        -> getState >>= \cs -> let message = FromServer . nl $ txt
                                   in mapM_ (`writeMsg` message) . M.elems . M.delete uid . msgQueues $ cs
 
@@ -215,3 +216,10 @@ nlTxt = T.singleton '\n'
 
 showTxt :: (Show a) => a -> Text
 showTxt = T.pack . show
+
+-- Commands
+usersCommand :: HasCallStack => MsgQueue -> ChatStack ()
+usersCommand mq = send mq . T.intercalate nlTxt . map showTxt =<< allUserIDs
+
+allUserIDs :: HasCallStack => ChatStack [UserID]
+allUserIDs = M.keys . msgQueues <$> getState
