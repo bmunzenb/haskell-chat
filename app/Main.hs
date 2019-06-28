@@ -99,6 +99,7 @@ startTalk h = do
   a <- runAsync . threadTalk uid h $ mq
   modifyState $ \cs -> let as = talkThreadAsyncs cs
                        in (cs { talkThreadAsyncs = M.insert uid a as }, ())
+  sendToAllOtherUsers uid $ "User " <> showTxt uid <> " connected."
 
 listenExHandler :: HasCallStack => SomeException -> ChatStack ()
 listenExHandler e = getState >>= \cs -> do
@@ -122,6 +123,8 @@ threadTalk uid h mq = talk `finally` cleanUp
                                  tas = talkThreadAsyncs cs
                              in (cs { msgQueues = M.delete uid mqs, talkThreadAsyncs = M.delete uid tas }, ())
         liftIO . hClose $ h
+        sendToAllOtherUsers uid $ "User " <> showTxt uid <> " disconnected."
+        
 
 -- This thread polls the handle for the client's connection. Incoming text is sent down the message queue.
 threadReceive :: HasCallStack => Handle -> MsgQueue -> ChatStack ()
@@ -151,8 +154,7 @@ interp uid mq txt = case T.toLower txt of
   "/quit"  -> send mq "See you next time!" >> writeMsg mq Dropped
   "/throw" -> throwIO PleaseDie -- For illustration/testing.
   "/users" -> usersCommand mq
-  _        -> getState >>= \cs -> let message = FromServer . nl $ txt
-                                  in mapM_ (`writeMsg` message) . M.elems . M.delete uid . msgQueues $ cs
+  _        -> sendToAllOtherUsers uid txt
 
 {-
 The Haskell language, software transactional memory, and this app are all architected in such a way that we need not concern ourselves with the usual pitfalls of sharing state across threads. This automatically rules out a whole class of potential bugs! Just remember the following:
@@ -221,5 +223,9 @@ showTxt = T.pack . show
 usersCommand :: HasCallStack => MsgQueue -> ChatStack ()
 usersCommand mq = send mq . T.intercalate nlTxt . map showTxt =<< allUserIDs
 
+-- Helpers
 allUserIDs :: HasCallStack => ChatStack [UserID]
 allUserIDs = M.keys . msgQueues <$> getState
+
+sendToAllOtherUsers :: HasCallStack => UserID -> Text -> ChatStack ()
+sendToAllOtherUsers uid txt = mapM_ (`send` txt) . M.elems . M.delete uid . msgQueues =<< getState
